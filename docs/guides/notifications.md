@@ -105,23 +105,40 @@ When the verbosity is set to `info`, the controller will alert if:
 
 ## Git commit status
 
-The `github` and `gitlab` provider are slightly different to the other chat providers. These providers will
-link an event back to its source by writing a commit status event to the repository. For more information about how a
-commit status works, refer to the [GitHub](https://docs.github.com/en/github/collaborating-with-issues-and-pull-requests/about-status-checks)
-or [GitLab](https://docs.gitlab.com/ee/api/commits.html) documentation.
+The GitHub, GitLab, Bitbucket, and Azure DevOps providers are slightly different to the other providers. Instead of
+a stateless stream of events, the git notification providers will link the event with accompanying git commit which
+triggered the event. The linking is done by updating the commit status of a specific commit.
+  - [GitHub](https://docs.github.com/en/github/collaborating-with-issues-and-pull-requests/about-status-checks)
+  - [GitLab](https://docs.gitlab.com/ee/api/commits.html)
+  - [Bitbucket](https://developer.atlassian.com/server/bitbucket/how-tos/updating-build-status-for-commits/)
+  - [Azure DevOps](https://docs.microsoft.com/en-us/rest/api/azure/devops/git/statuses?view=azure-devops-rest-6.0)
 
-The first image is an example of how it may look like in GitHub while the one below is an example for GitLab.
-![github commit status](../_files/github-commit-status.png)
-![gitlab commit status](../_files/gitlab-commit-status.png)
+In GitHub the commit status set by notification-controller will result in a green checkmark or red cross next to the commit hash.
+Clicking the icon will show more detailed information about the status.
+![commit status GitHub overview](../_files/commit-status-github-overview.png)
 
-Currently the provider will only work with Alerts for Kustomization resources as the events have to be linked with a
-specific git commit. Any other event that does not contain a commit reference will be ignored by the provider.
-Each status will contain some additional information from the event which includes the resource kind, name and reason for the event.
-It will be displayed in the format of `{{ .Kind }}/{{ .Name }} - {{ .Reason }}`.
+Receiving an event in the form of a commit status rather than a message in a chat conversation has the benefit
+that it closes the deployment loop giving quick and visible feedback if a commit has reconciled and if it succeeded.
+This means that a deployment will work in a similar manner that people are used to with "traditional" push based CD pipelines.
+Additionally the status can be fetched from the git providers API for a specific commit. Allowing for custom automation tools
+that can automatically promote, commit to a new directory, after receiving a successful commit status. This can all be
+done without requiring any access to the Kubernetes cluster.
+
+As stated before the provider works by referencing the same git repository as the Kustomization controller does.
+When a new commit is pushed to the repository, source-controller will sync the commit, triggering the kustomize-controller
+to reconcile the new commit. After this is done the kustomize-controller sends an event to the notification-controller
+with the result and the commit hash it reconciled. Then notification-controller can update the correct commit and repository
+when receiving the event.
+![commit status flow](../_files/commit-status-flow.png)
+
+!!! hint "Limitations"
+    The git notification providers require that a commit hash present in the meta data
+    of the event. There for the the providers will only work with `Kustomization` as an
+    event source, as it is the only resource which includes this data.
 
 To get started the git provider require an authentication token to communicate with the API.
-Follow the [GitHub](https://docs.github.com/en/github/authenticating-to-github/creating-a-personal-access-token)
-or [Gitlab](https://docs.gitlab.com/ee/user/profile/personal_access_tokens.html) for a detailed guide how to create a token.
+The authentication method depends on the git provider used, refer to the [Provider CRD](../../components/notification/provider/#git-commit-status)
+for details about how to get the correct token. The guide will use GitHub as an example.
 Store the generated token in a Secret with the following data format.
 ```yaml
 apiVersion: v1
@@ -133,9 +150,36 @@ data:
   token: <token>
 ```
 
+The token will need to have write access to the repository it is going to update the commit status in.
+Begin with forking the [podinfo](https://github.com/stefanprodan/podinfo) repository in your own GitHub account.
+Create a `Kustomization` that deploys it from your own fork. Make sure that you replace `<username>`
+with your own GitHub username.
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1beta1
+kind: GitRepository
+metadata:
+  name: podinfo
+  namespace: flux-system
+spec:
+  interval: 5m
+  url: https://github.com/<username>/podinfo
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1beta1
+kind: Kustomization
+metadata:
+  name: podinfo
+  namespace: flux-system
+spec:
+  interval: 5m
+  path: "./kustomize"
+  sourceRef:
+    kind: GitRepository
+    name: podinfo
+```
+
 Creating a git provider is very similar to creating other types of providers.
 The only caveat being that the provider address needs to point to the same
-git repository as the Kustomization resource refers to.
+git repository as the event source originates from.
 ```yaml
 apiVersion: notification.toolkit.fluxcd.io/v1beta1
 kind: Provider
@@ -145,7 +189,7 @@ metadata:
 spec:
   type: github
   channel: general
-  address: https://github.com/stefanprodan/podinfo
+  address: https://github.com/<username>/podinfo
   secretRef:
     name: github
 ---
@@ -164,14 +208,23 @@ spec:
       namespace: flux-system
 ```
 
-The secret referenced in the provider is expected to contain a [personal access token](https://docs.github.com/en/github/authenticating-to-github/creating-a-personal-access-token)
-to authenticate with the GitHub API.
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: github
-  namespace: flux-system
-data:
-  token: <token>
-```
+The first image is an example of how it may look like in GitHub while the one below is an example for GitLab.
+![github commit status](../_files/github-commit-status.png)
+![gitlab commit status](../_files/gitlab-commit-status.png)
+
+### Status changes
+The provider will continuously receive events as they happen, and multiple events may
+be received for the same commit hash. The git providers are configured to only update
+the status if the status has changed. This is to avoid spamming the commit status
+history with the same status over and over again.
+
+There is an aspect of state fullness that needs to be considered, compared to the other
+notification providers, as the events are stored by the git provider. This means that
+the status of a commit can change over time. Initially a deployment may be healthy, resulting
+in a successful status. Down the line the application, and the health check, may start failing
+due to the amount of traffic it receives or external dependencies no longer being available.
+The change in the health check would cause the status to go from successful to failed.
+It is important to keep this in mind when building any automation tools that deals with the
+status, and consider the fact that receiving a successful status once does not mean it will
+always be successful.
+
